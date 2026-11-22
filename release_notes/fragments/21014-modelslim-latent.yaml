@@ -2,5 +2,8 @@ pr: 21014
 entries:
   - category: bugfix
     text: >-
-      Fixed loading ModelSlim Mistral Large 4 checkpoints with a quantized MLA
-      latent projection while preserving the native FP8 checkpoint behavior.
+      Fixed loading ModelSlim Mistral Large 4 checkpoints with quantized MLA
+      projections, including resolving MXFP8 KV expansion weights before attention
+      absorption, while preserving native FP8 checkpoint behavior.
+  - category: bugfix
+    text: Excluded Indexer LayerNorm bias metadata when detecting anti-outlier RMSNorm bias.

@@ -52,6 +52,36 @@ def _spec(layer_idx: int, kv_source_layer: int, has_indexer: bool = True):
     )
 
 
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_modelslim_absorbed_weight_pairs_scales_in_either_order(scale_first):
+    name = "layers.1.attention.wkv_b"
+    weight = torch.ones(1, 96).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[126, 128, 0]], dtype=torch.uint8)
+    pair = [(name + ".weight", weight), (name + ".weight_scale", scale)]
+    if scale_first:
+        pair.reverse()
+    passthrough = ("layers.1.attention.wq.weight", torch.ones(1, 1))
+    result = dict(ml4._dense_wkv_b_weights([pair[0], passthrough, pair[1]]))
+    expected = torch.cat((torch.full((1, 32), 0.5), torch.full((1, 32), 2.0), torch.ones(1, 32)), dim=1)
+    torch.testing.assert_close(result[name + ".weight"], expected.to(torch.bfloat16))
+    assert result[passthrough[0]] is passthrough[1]
+    assert name + ".weight_scale" not in result
+
+
+def test_absorbed_native_dense_weight_is_preserved():
+    name = "layers.1.attention.wkv_b.weight"
+    weight = torch.randn(3, 32, dtype=torch.bfloat16)
+    assert dict(ml4._dense_wkv_b_weights([(name, weight)]))[name] is weight
+
+
+@pytest.mark.parametrize("kind", ["weight", "weight_scale"])
+def test_absorbed_mxfp8_weight_rejects_an_incomplete_pair(kind):
+    name = "layers.1.attention.wkv_b." + kind
+    tensor = torch.ones(1, 32).to(torch.float8_e4m3fn) if kind == "weight" else torch.ones(1, 1, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="missing its pair"):
+        list(ml4._dense_wkv_b_weights([(name, tensor)]))
+
+
 @pytest.mark.parametrize("modelslim", [False, True])
 def test_latent_projection_loads_modelslim_scale(monkeypatch, modelslim):
     """Load a real latent scale parameter; native FP8 must retain bf16 weights."""

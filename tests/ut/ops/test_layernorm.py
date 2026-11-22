@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -89,6 +90,17 @@ def test_RMSNorm_creates_bias_from_quant_description(default_vllm_config):
 
     assert layer.bias is not None
     assert not layer.bias.requires_grad
+
+
+def test_RMSNorm_ignores_indexer_layernorm_bias(default_vllm_config):
+    default_vllm_config.quant_config = SimpleNamespace(
+        quant_description={
+            "model.layers.0.self_attn.indexer.q_input_norm.bias": "FLOAT",
+            "model.layers.0.self_attn.indexer.k_norm.bias": "FLOAT",
+        }
+    )
+    layer = RMSNorm(hidden_size=8, eps=1e-05)
+    assert layer.bias is None
 
 
 @patch("vllm_ascend.ops.layernorm.enable_custom_op", return_value=True)

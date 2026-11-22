@@ -285,6 +285,8 @@ class AscendMistralMLAAttention(MistralMLAAttention):
                 prefix=f"{prefix}.kv_a_proj_with_mqa",
             )
             self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        # SFA absorbs this dense matrix into W_UK/W_UV. ModelSlim supplies
+        # MXFP8 weights; _dense_wkv_b_weights resolves them before loading.
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             config.num_attention_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -630,6 +632,43 @@ def validate_moe_parallelism(vllm_config: VllmConfig) -> None:
         )
 
 
+_MX_GROUP_SIZE = 32
+
+
+def _mx_dequantize(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Expand a ModelSlim MXFP8 weight into its dense bf16 value.
+
+    ``weight`` is FP8 E4M3 shaped (out, in) and ``scale`` carries one E8M0
+    byte per 32-element input group, so the multiplier is 2**(byte - 127).
+    A zero byte is the neutral marker and reads as 127, as in mxfp_c8.
+    """
+    raw = scale.to(torch.int32)
+    raw = torch.where(raw == 0, torch.full_like(raw, 127), raw)
+    multiplier = torch.exp2(raw.to(torch.float32) - 127.0)
+    multiplier = multiplier.repeat_interleave(_MX_GROUP_SIZE, dim=-1)[..., : weight.shape[-1]]
+    return (weight.to(torch.float32) * multiplier).to(torch.bfloat16)
+
+
+def _dense_wkv_b_weights(weights):
+    """Pair ModelSlim MXFP8 wkv_b tensors before the dense SFA loader."""
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+    for name, tensor in weights:
+        base, _, kind = name.rpartition(".")
+        if base.endswith(".attention.wkv_b") and kind in ("weight", "weight_scale"):
+            if kind == "weight" and tensor.dtype != torch.float8_e4m3fn:
+                yield name, tensor
+                continue
+            slot = pending.setdefault(base, {})
+            slot[kind] = tensor
+            if len(slot) == 2:
+                del pending[base]
+                yield f"{base}.weight", _mx_dequantize(slot["weight"], slot["weight_scale"])
+            continue
+        yield name, tensor
+    if pending:
+        raise ValueError(f"MXFP8 wkv_b is missing its pair: {sorted(pending)}")
+
+
 class MistralLarge4MixtureOfExperts(MixtureOfExperts):
     """Model-level MoE bookkeeping that the EPLB controller reads.
 
@@ -749,7 +788,7 @@ class AscendMistralLarge4ForCausalLM(MistralLarge4ForCausalLM, MistralLarge4Mixt
         return AscendModelState
 
     def load_weights(self, weights):
-        loaded = super().load_weights(weights)
+        loaded = super().load_weights(_dense_wkv_b_weights(weights))
         # Mistral owns a shared MistralRotaryEmbedding rather than one of the
         # classes replaced by vLLM-Ascend's RoPE registry. Publish its final
         # LeRoPE-adjusted cache only after weight loading has rebuilt it;
