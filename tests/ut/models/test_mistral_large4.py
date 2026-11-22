@@ -52,6 +52,70 @@ def _spec(layer_idx: int, kv_source_layer: int, has_indexer: bool = True):
     )
 
 
+@pytest.mark.parametrize("modelslim", [False, True])
+def test_latent_projection_loads_modelslim_scale(monkeypatch, modelslim):
+    """Load a real latent scale parameter; native FP8 must retain bf16 weights."""
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    from vllm_ascend.ops import linear as ascend_linear
+    from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+    from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
+
+    scheme = AscendW8A8MXFP8DynamicLinearMethod.__new__(AscendW8A8MXFP8DynamicLinearMethod)
+    scheme.group_size = 32
+    quant_config = SimpleNamespace(
+        quant_description={"group_size": 32} if modelslim else {},
+        get_quant_method=lambda layer, prefix: AscendLinearMethod(scheme),
+    )
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(ascend_linear, "get_replicated_op", lambda *args: (None, 0, 1))
+    monkeypatch.setattr(ml4, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(ml4, "ColumnParallelLinear", lambda *args, **kwargs: torch.nn.Identity())
+    monkeypatch.setattr(ml4, "RowParallelLinear", lambda *args, **kwargs: torch.nn.Identity())
+    monkeypatch.setattr(ml4, "RMSNorm", lambda *args, **kwargs: torch.nn.Identity())
+
+    class Attention(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.mla_attn = SimpleNamespace(impl=SimpleNamespace())
+
+    monkeypatch.setattr(ml4, "AscendMultiHeadLatentAttention", Attention)
+    config = SimpleNamespace(
+        hidden_size=32,
+        num_attention_heads=1,
+        q_lora_rank=None,
+        kv_lora_rank=8,
+        qk_rope_head_dim=4,
+        qk_nope_head_dim=8,
+        v_head_dim=8,
+        rms_norm_eps=1e-5,
+        ssmax_scaling=False,
+    )
+    module = ml4.AscendMistralMLAAttention(
+        SimpleNamespace(quant_config=quant_config, cache_config=None),
+        config,
+        _spec(0, 0, has_indexer=False),
+        "model.layers.0.self_attn",
+        None,
+        None,
+        (torch.zeros(1, 8), torch.zeros(1, 4)),
+    )
+    projection = module.kv_a_proj_with_mqa
+    if modelslim:
+        scale = dict(module.named_parameters())["kv_a_proj_with_mqa.weight_scale"]
+        checkpoint_scale = torch.full((12, 1), 127, dtype=torch.uint8)
+        scale.weight_loader(scale, checkpoint_scale)
+        torch.testing.assert_close(scale, checkpoint_scale)
+        assert projection.weight.dtype == torch.float8_e4m3fn
+    else:
+        assert "weight_scale" not in dict(projection.named_parameters())
+        assert projection.weight.dtype == torch.get_default_dtype()
+
+
 # B024: an ABC with no abstract methods is the point. The stand-in has to
 # inherit from abc.ABC to get the layout AscendSFAImpl has -- a metaclass=
 # ABCMeta class does not reproduce it, and neither does a plain class -- and

@@ -265,6 +265,9 @@ class AscendMistralMLAAttention(MistralMLAAttention):
         self.qk_nope_head_dim = config.qk_nope_head_dim if spec.use_rope else self.qk_head_dim
         self.v_head_dim = config.v_head_dim
         self.zero_kv_c, self.zero_k_pe = zero_kv_inputs
+        # ModelSlim checkpoints may quantize the latent projection, whereas
+        # Mistral's native FP8 checkpoints leave it in bf16.
+        latent_quant_config = quant_config if getattr(quant_config, "quant_description", None) else None
 
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -278,7 +281,7 @@ class AscendMistralMLAAttention(MistralMLAAttention):
                 config.hidden_size,
                 self.kv_lora_rank + (self.qk_rope_head_dim if spec.use_rope else 0),
                 bias=False,
-                quant_config=None,
+                quant_config=latent_quant_config,
                 prefix=f"{prefix}.kv_a_proj_with_mqa",
             )
             self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)

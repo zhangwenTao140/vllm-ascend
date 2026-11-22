@@ -1,0 +1,6 @@
+pr: 21014
+entries:
+  - category: bugfix
+    text: >-
+      Fixed loading ModelSlim Mistral Large 4 checkpoints with a quantized MLA
+      latent projection while preserving the native FP8 checkpoint behavior.
