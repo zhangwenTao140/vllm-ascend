@@ -66,6 +66,7 @@ def test_set_attn_preserves_cache_group_order(monkeypatch):
 
     def parent_set_attn(self, *_args):
         assert active_context == [draft_config]
+        self.model_state = SimpleNamespace()
         self._context_slot_mappings = torch.zeros(2, dtype=torch.int64)
         self.attn_groups = [[SimpleNamespace(backend=_BackendA)]]
 

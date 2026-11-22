@@ -282,7 +282,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         if (
             not envs.VLLM_ASCEND_MISTRAL_FLASHMLA_SKIP_UNUSED_METADATA
             or self.use_dcp
-            or self.replicated_pcp
+            or self.vllm_config.parallel_config.prefill_context_parallel_size > 1
             or self.vllm_config.kv_transfer_config is not None
         ):
             return

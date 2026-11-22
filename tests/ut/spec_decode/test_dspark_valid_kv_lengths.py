@@ -29,6 +29,36 @@ def _spec(lengths, *, architecture="MLA", use_dcp=False):
     return spec
 
 
+@pytest.mark.parametrize("pcp_size", [1, 2])
+def test_flashmla_metadata_uses_config_without_replicated_pcp_attribute(monkeypatch, pcp_size):
+    monkeypatch.setenv("VLLM_ASCEND_MISTRAL_FLASHMLA_SKIP_UNUSED_METADATA", "1")
+    spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
+    spec.use_dcp = False
+    spec.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp_size),
+        kv_transfer_config=None,
+    )
+    spec.model_state = SimpleNamespace()
+    draft = SimpleNamespace(
+        layer_names=["draft.0"],
+        get_metadata_builder=lambda index: SimpleNamespace(flashmla_state=object()),
+    )
+    target = SimpleNamespace(layer_names=["target.0"])
+    spec.attn_groups = [[draft]]
+    spec.draft_attn_layer_names = {"draft.0"}
+    groups = [[target, draft]]
+
+    spec._configure_flashmla_metadata_builds(groups)
+
+    assert spec._flashmla_replay_builds_metadata == (pcp_size == 1)
+    if pcp_size == 1:
+        original, filtered = spec.model_state._flashmla_target_graph_groups
+        assert original is groups
+        assert filtered == [[target]]
+    else:
+        assert spec.model_state._flashmla_target_graph_groups is None
+
+
 @pytest.mark.parametrize("length,padded", [(73, 1), (22666, 2), (81, 4), (22667, 4)])
 def test_exact_valid_lengths_ignore_target_upper_bound(length, padded):
     # The observed target upper bound + width overstated the draft by 1 or 8.
@@ -125,7 +155,7 @@ def test_dummy_replay_uses_dp_agreed_request_count(monkeypatch, padded):
     spec.num_query_per_req = 4
     spec.max_num_tokens = 20
     spec.arange_np = np.arange(6, dtype=np.int32)
-    spec.replicated_pcp = False
+    spec.pcp_manager = None
     spec.enable_adaptive_verification = False
     spec._group_causal = False
     spec.vllm_config = SimpleNamespace(parallel_config=object())
