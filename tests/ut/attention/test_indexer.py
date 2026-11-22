@@ -22,6 +22,61 @@ from vllm_ascend.device.device_op import A5DeviceAdaptor
 _KERNEL_BLOCK_SIZE = 128
 
 
+@pytest.mark.parametrize("precomputed_query", [False, True])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_indexer_forward_preserves_fused_weights_and_precomputed_query(precomputed_query, quantized):
+    hidden = torch.zeros(2, 4)
+    key = torch.zeros(2, 4)
+    slots = torch.arange(2)
+    weights = torch.ones(2, 2)
+    fused_weights = weights * 2
+    query = torch.full((2, 2, 2), 3.0)
+    quantized_query = torch.full((2, 2, 2), 4.0)
+    scale = torch.ones(2, 2, 1) if quantized else None
+    projected_query = quantized_query if quantized else query
+    shape = query.shape if quantized else None
+    topk = torch.tensor([[1, 2], [3, 4]])
+    metadata = SimpleNamespace(
+        cos=torch.ones(2, 2),
+        sin=torch.zeros(2, 2),
+        cache_scatter_indices=None,
+        actual_seq_lengths_query=torch.tensor([1, 2]),
+        actual_seq_lengths_key=torch.tensor([1, 2]),
+        topk_selector=Mock(return_value=topk),
+    )
+    backend = SimpleNamespace(
+        _select_execution_paths=Mock(return_value=(object() if precomputed_query else None, False, False)),
+        _forward_qk=Mock(return_value=((projected_query, scale, shape), key, None, weights)),
+        forward_k=Mock(return_value=(key, None, weights)),
+        _gather_cache_inputs=Mock(return_value=(key, None, slots)),
+        write_cache=Mock(),
+        wk_weights_proj=object(),
+        wq_b=object(),
+        _project_query_and_weights=Mock(return_value=(query, fused_weights)),
+        _quantize_li_tensor=Mock(return_value=(quantized_query, scale)),
+        enable_sparse_li_quant=quantized,
+    )
+
+    result = AscendSFAIndexerBackend.forward(backend, hidden, hidden, hidden, metadata)
+
+    assert result is topk
+    selected_query, selected_weights, selected_backend, selected_metadata, selected_scale = (
+        metadata.topk_selector.call_args.args
+    )
+    assert selected_query is projected_query
+    assert selected_weights is (weights if precomputed_query else fused_weights)
+    assert selected_backend is backend
+    assert selected_metadata is metadata
+    assert selected_scale is scale
+    backend.write_cache.assert_called_once()
+    if precomputed_query:
+        backend._project_query_and_weights.assert_not_called()
+        backend._quantize_li_tensor.assert_not_called()
+    else:
+        backend._project_query_and_weights.assert_called_once_with(hidden, hidden, metadata.cos, metadata.sin, weights)
+        assert backend._quantize_li_tensor.call_count == int(quantized)
+
+
 def _make_builder(
     pcp_size: int = 1,
     dcp_size: int = 1,
